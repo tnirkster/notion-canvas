@@ -1,0 +1,237 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Minimal Drawing Canvas</title>
+  <style>
+    :root { --bg:#0e0e10; --fg:#ffffff; --ui:#1a1a1d; --ui2:#2a2a2e; }
+    * { box-sizing: border-box; }
+    html, body { height:100%; margin:0; background:var(--bg); color:var(--fg); font:14px/1.4 system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, Helvetica, Arial; }
+    .app { height:100%; display:flex; flex-direction:row; }
+    .toolbar { display:flex; flex-direction:column; align-items:center; gap:1.2rem; padding:1rem; background:var(--ui); border-right:1px solid #000; min-width:80px; }
+    .toolbar label { display:flex; flex-direction:column; align-items:center; gap:.4rem; font-size:0.8rem; color:var(--fg); }
+    .toolbar input[type="range"] { writing-mode: bt-lr; -webkit-appearance: slider-vertical; width:28px; height:160px; accent-color:#fff; }
+    .toolbar input[type="color"] { inline-size: 42px; block-size: 36px; padding:0; border:2px solid #000; border-radius:.4rem; background:var(--ui2); cursor:pointer; }
+    .toolbar button { background:var(--ui2); border:2px solid #000; border-radius:.6rem; width:64px; height:64px; font-size:30px; display:flex; align-items:center; justify-content:center; cursor:pointer; color:#fff; }
+    .toolbar button:active { transform: translateY(1px); }
+    .stage { position:relative; flex:1; min-height:0; }
+    #grid, #pad { position:absolute; inset:0; width:100%; height:100%; display:block; }
+    #pad { touch-action:none; }
+  </style>
+</head>
+<body>
+  <div class="app" id="app">
+    <div class="toolbar">
+      <label title="Linienstärke">
+        ✏️
+        <input id="size" type="range" min="1" max="30" step="1" value="4" />
+      </label>
+      <label title="Farbe">
+        🎨
+        <input id="color" type="color" value="#ffffff" />
+      </label>
+      <button id="undo" type="button" title="Undo">↩️</button>
+      <button id="redo" type="button" title="Redo">↪️</button>
+      <button id="clear" type="button" title="Clear">🗑️</button>
+    </div>
+    <div class="stage">
+      <canvas id="grid" aria-hidden="true"></canvas>
+      <canvas id="pad" aria-label="Zeichenfläche"></canvas>
+    </div>
+  </div>
+
+  <script>
+  (() => {
+    const grid = document.getElementById('grid');
+    const gtx = grid.getContext('2d');
+    const canvas = document.getElementById('pad');
+    const ctx = canvas.getContext('2d');
+
+    const size = document.getElementById('size');
+    const color = document.getElementById('color');
+    const clearBtn = document.getElementById('clear');
+    const undoBtn = document.getElementById('undo');
+    const redoBtn = document.getElementById('redo');
+
+    let drawing = false;
+    let points = [];
+    let snapshot = null;
+    let allPaths = [];
+    let redoStack = [];
+
+    let activeStrokeColor = '#ffffff';
+    let activeStrokeWidth = 4;
+
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+    ctx.strokeStyle = color.value;
+    ctx.lineWidth = Number(size.value);
+
+    size.addEventListener('input', () => { ctx.lineWidth = Number(size.value); });
+    color.addEventListener('input', () => { ctx.strokeStyle = color.value; });
+
+    function sizeAndScaleCanvas(el, context) {
+      const dpr = window.devicePixelRatio || 1;
+      const w = Math.max(1, Math.floor(el.clientWidth * dpr));
+      const h = Math.max(1, Math.floor(el.clientHeight * dpr));
+      context.setTransform(1,0,0,1,0,0);
+      el.width = w; el.height = h;
+      context.scale(dpr, dpr);
+    }
+
+    function resizeAll() {
+      sizeAndScaleCanvas(grid, gtx);
+      sizeAndScaleCanvas(canvas, ctx);
+      drawGrid();
+      redrawAll();
+    }
+
+    function clearDrawLayer() {
+      ctx.save();
+      ctx.setTransform(1,0,0,1,0,0);
+      ctx.clearRect(0,0,canvas.width,canvas.height);
+      ctx.restore();
+    }
+
+    function drawGrid() {
+      const spacing = 24;
+      const dotR = 1;
+      const dotColor = 'rgba(255,255,255,0.08)';
+      const dpr = window.devicePixelRatio || 1;
+
+      const tile = document.createElement('canvas');
+      tile.width = Math.max(1, Math.floor(spacing * dpr));
+      tile.height = Math.max(1, Math.floor(spacing * dpr));
+      const t = tile.getContext('2d');
+      t.fillStyle = dotColor;
+      t.beginPath();
+      t.arc((0.5*spacing)*dpr, (0.5*spacing)*dpr, dotR*dpr, 0, Math.PI*2);
+      t.fill();
+
+      gtx.save();
+      gtx.setTransform(1,0,0,1,0,0);
+      gtx.clearRect(0,0,grid.width,grid.height);
+      const pattern = gtx.createPattern(tile, 'repeat');
+      gtx.fillStyle = pattern;
+      gtx.fillRect(0,0,grid.width,grid.height);
+      gtx.restore();
+    }
+
+    function getPos(e) { return { x: e.offsetX, y: e.offsetY }; }
+
+    function drawSmoothPath(pts, strokeStyle, lineWidth) {
+      if (pts.length < 2) return;
+      ctx.strokeStyle = strokeStyle;
+      ctx.lineWidth = lineWidth;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length - 2; i++) {
+        const c = (pts[i].x + pts[i + 1].x) / 2;
+        const d = (pts[i].y + pts[i + 1].y) / 2;
+        ctx.quadraticCurveTo(pts[i].x, pts[i].y, c, d);
+      }
+      const n = pts.length - 1;
+      ctx.quadraticCurveTo(pts[n - 1].x, pts[n - 1].y, pts[n].x, pts[n].y);
+      ctx.stroke();
+    }
+
+    function redrawAll() {
+      clearDrawLayer();
+      for (const path of allPaths) {
+        drawSmoothPath(path.points, path.color, path.width);
+      }
+    }
+
+    function pointerDown(e) {
+      if (e.button !== undefined && e.button !== 0) return;
+      drawing = true;
+      points = [getPos(e)];
+      activeStrokeColor = color.value;
+      activeStrokeWidth = Number(size.value);
+      ctx.save();
+      ctx.setTransform(1,0,0,1,0,0);
+      snapshot = ctx.getImageData(0, 0, canvas.width, canvas.height);
+      ctx.restore();
+      try { canvas.setPointerCapture(e.pointerId); } catch {}
+      e.preventDefault();
+    }
+
+    function pointerMove(e) {
+      if (!drawing) return;
+      const p = getPos(e);
+      points.push(p);
+      if (snapshot) {
+        ctx.save();
+        ctx.setTransform(1,0,0,1,0,0);
+        ctx.putImageData(snapshot, 0, 0);
+        ctx.restore();
+      }
+      drawSmoothPath(points, activeStrokeColor, activeStrokeWidth);
+      e.preventDefault();
+    }
+
+    function pointerUp(e) {
+      if (!drawing) return;
+      if (snapshot) {
+        ctx.save();
+        ctx.setTransform(1,0,0,1,0,0);
+        ctx.putImageData(snapshot, 0, 0);
+        ctx.restore();
+      }
+      if (points.length === 1) {
+        const p = points[0];
+        ctx.beginPath();
+        ctx.fillStyle = activeStrokeColor;
+        ctx.arc(p.x, p.y, activeStrokeWidth/2, 0, Math.PI*2);
+        ctx.fill();
+        allPaths.push({ points:[{...p},{...p}], color: activeStrokeColor, width: activeStrokeWidth });
+      } else {
+        drawSmoothPath(points, activeStrokeColor, activeStrokeWidth);
+        allPaths.push({ points: points.slice(0), color: activeStrokeColor, width: activeStrokeWidth });
+      }
+      drawing = false;
+      points = [];
+      snapshot = null;
+      redoStack = [];
+      try { canvas.releasePointerCapture(e.pointerId); } catch {}
+      e.preventDefault();
+    }
+
+    canvas.addEventListener('pointerdown', pointerDown);
+    canvas.addEventListener('pointermove', pointerMove);
+    window.addEventListener('pointerup', pointerUp);
+    canvas.addEventListener('pointerleave', pointerUp);
+
+    clearBtn.addEventListener('click', () => {
+      allPaths = [];
+      redoStack = [];
+      clearDrawLayer();
+    });
+
+    undoBtn.addEventListener('click', () => {
+      if (allPaths.length > 0) {
+        const last = allPaths.pop();
+        redoStack.push(last);
+        redrawAll();
+      }
+    });
+
+    redoBtn.addEventListener('click', () => {
+      if (redoStack.length > 0) {
+        const path = redoStack.pop();
+        allPaths.push(path);
+        redrawAll();
+      }
+    });
+
+    const ro = new ResizeObserver(() => { resizeAll(); });
+    ro.observe(canvas);
+    window.addEventListener('orientationchange', resizeAll);
+
+    resizeAll();
+    clearDrawLayer();
+  })();
+  </script>
+</body>
+</html>
